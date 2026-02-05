@@ -57,7 +57,8 @@ _Noreturn void die(const char *msg);
 
 #define finit_module(fd, param_values, flags) (int)syscall(__NR_finit_module, fd, param_values, flags)
 #define DEFAULT_PATH_ENV "PATH=/sbin:/usr/sbin:/bin:/usr/bin"
-#define NSM_PATH "nsm.ko"
+#define MODULES_LOAD_ORDER_PATH "modules_load_order"
+#define MAX_MODULE_PATH_LEN 256
 #define TIMEOUT 20000 // millis
 #define VSOCK_PORT 9000
 #define VSOCK_CID 3
@@ -374,22 +375,61 @@ void enclave_ready() {
     die_on(close(socket_fd), "close");
 }
 
-void init_nsm_driver() {
+void load_module(const char *module_path) {
     int fd;
     int rc;
 
-    fd = open(NSM_PATH, O_RDONLY | O_CLOEXEC);
+    printf("Loading module: %s\n", module_path);
+
+    fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) {
+        fprintf(stderr, "Warning: module file not found: %s\n", module_path);
         return;
     }
-    die_on(fd < 0, "failed to open nsm fd");
+    if (fd < 0) {
+        warn2("failed to open module", module_path);
+        dien();
+    }
     rc = finit_module(fd, "", 0);
-    die_on(rc < 0, "failed to insert nsm driver");
+    if (rc < 0) {
+        warn2("failed to insert module", module_path);
+        close(fd);
+        dien();
+    }
 
-    die_on(close(fd), "close nsm fd");
-    rc = unlink(NSM_PATH);
-    if (rc < 0)
-        warn("Could not unlink " NSM_PATH);
+    die_on(close(fd), "close module fd");
+    rc = unlink(module_path);
+    if (rc < 0) {
+        fprintf(stderr, "Warning: could not unlink %s\n", module_path);
+    }
+}
+
+void init_modules() {
+    FILE *f = fopen(MODULES_LOAD_ORDER_PATH, "r");
+    if (f == NULL) {
+        if (errno == ENOENT) {
+            return;
+        }
+        die2("fopen", MODULES_LOAD_ORDER_PATH);
+    }
+
+    char module_path[MAX_MODULE_PATH_LEN];
+    while (fgets(module_path, sizeof(module_path), f) != NULL) {
+        // Remove trailing newline if present
+        size_t len = strlen(module_path);
+        if (len > 0 && module_path[len - 1] == '\n') {
+            module_path[len - 1] = '\0';
+            len--;
+        }
+        // Skip empty lines and comments
+        if (len == 0 || module_path[0] == '#') {
+            continue;
+        }
+        load_module(module_path);
+    }
+
+    fclose(f);
+    unlink(MODULES_LOAD_ORDER_PATH);
 }
 
 int main() {
@@ -403,8 +443,8 @@ int main() {
     init_dev();
     init_console();
 
-    // Insert the Nitro Secure Module driver
-    init_nsm_driver();
+    // Insert kernel modules from modules_load_order
+    init_modules();
 
     // Signal nitro-cli that the enclave has started
     enclave_ready();
