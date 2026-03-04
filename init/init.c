@@ -59,6 +59,8 @@ _Noreturn void die(const char *msg);
 #define DEFAULT_PATH_ENV "PATH=/sbin:/usr/sbin:/bin:/usr/bin"
 #define MODULES_LOAD_ORDER_PATH "modules_load_order"
 #define MAX_MODULE_PATH_LEN 256
+#define MAX_CMDLINE_LEN 4096
+#define MAX_MODULE_PARAMS_LEN 1024
 #define TIMEOUT 20000 // millis
 #define VSOCK_PORT 9000
 #define VSOCK_CID 3
@@ -132,6 +134,11 @@ const struct InitOp ops[] = {
     // mount /sys (which should already exist)
     { OpMount, .mount = { "sysfs", "/sys", "sysfs", MS_NODEV | MS_NOSUID | MS_NOEXEC } },
     { OpMount, .mount = { "cgroup_root", "/sys/fs/cgroup", "tmpfs", MS_NODEV | MS_NOSUID | MS_NOEXEC, "mode=0755" } },
+};
+
+const struct InitOp early_ops[] = {
+    { OpMkdir, .mkdir = { "/proc", 0755 } },
+    { OpMount, .mount = { "proc", "/proc", "proc", MS_NODEV | MS_NOSUID | MS_NOEXEC } },
 };
 
 void warn(const char *msg) {
@@ -375,11 +382,118 @@ void enclave_ready() {
     die_on(close(socket_fd), "close");
 }
 
+static char *kernel_cmdline = NULL;
+
+char *get_kernel_cmdline() {
+    if (kernel_cmdline != NULL) {
+        return kernel_cmdline;
+    }
+
+    FILE *f = fopen("/proc/cmdline", "r");
+    if (f == NULL) {
+        return NULL;
+    }
+
+    kernel_cmdline = malloc(MAX_CMDLINE_LEN);
+    if (kernel_cmdline == NULL) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fgets(kernel_cmdline, MAX_CMDLINE_LEN, f) == NULL) {
+        free(kernel_cmdline);
+        kernel_cmdline = NULL;
+        fclose(f);
+        return NULL;
+    }
+
+    // Remove trailing newline
+    size_t len = strlen(kernel_cmdline);
+    if (len > 0 && kernel_cmdline[len - 1] == '\n') {
+        kernel_cmdline[len - 1] = '\0';
+    }
+
+    fclose(f);
+    return kernel_cmdline;
+}
+
+// Extract module name from path (e.g., "nsm.ko" -> "nsm", "path/to/foo.ko" -> "foo")
+void get_module_name(const char *module_path, char *module_name, size_t max_len) {
+    const char *basename = strrchr(module_path, '/');
+    if (basename != NULL) {
+        basename++;
+    } else {
+        basename = module_path;
+    }
+
+    strncpy(module_name, basename, max_len - 1);
+    module_name[max_len - 1] = '\0';
+
+    // Remove .ko extension if present
+    char *ext = strstr(module_name, ".ko");
+    if (ext != NULL && (ext[3] == '\0' || ext[3] == '.')) {
+        *ext = '\0';
+    }
+}
+
+// Extract parameters for a module from kernel cmdline
+// Parameters are in the form: module_name.param or module_name.param=value
+void get_module_params(const char *module_name, char *params, size_t max_len) {
+    params[0] = '\0';
+
+    char *cmdline = get_kernel_cmdline();
+    if (cmdline == NULL) {
+        return;
+    }
+
+    size_t module_name_len = strlen(module_name);
+    size_t params_offset = 0;
+    char *cmdline_copy = strdup(cmdline);
+    if (cmdline_copy == NULL) {
+        return;
+    }
+
+    char *token = strtok(cmdline_copy, " ");
+    while (token != NULL) {
+        // Check if token starts with "module_name."
+        if (strncmp(token, module_name, module_name_len) == 0 &&
+            token[module_name_len] == '.') {
+            // Extract the parameter part (after "module_name.")
+            const char *param = token + module_name_len + 1;
+            size_t param_len = strlen(param);
+
+            // Add space separator if not first parameter
+            if (params_offset > 0 && params_offset + 1 < max_len) {
+                params[params_offset++] = ' ';
+            }
+
+            // Copy parameter if it fits
+            if (params_offset + param_len < max_len) {
+                strcpy(params + params_offset, param);
+                params_offset += param_len;
+            }
+        }
+        token = strtok(NULL, " ");
+    }
+
+    free(cmdline_copy);
+}
+
 void load_module(const char *module_path) {
     int fd;
     int rc;
+    char module_name[MAX_MODULE_PATH_LEN];
+    char module_params[MAX_MODULE_PARAMS_LEN];
 
     printf("Loading module: %s\n", module_path);
+
+    // Extract module name and get parameters from cmdline
+    get_module_name(module_path, module_name, sizeof(module_name));
+    get_module_params(module_name, module_params, sizeof(module_params));
+
+    if (module_params[0] != '\0') {
+        printf("  with parameters: %s\n", module_params);
+    }
 
     fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) {
@@ -390,7 +504,7 @@ void load_module(const char *module_path) {
         warn2("failed to open module", module_path);
         dien();
     }
-    rc = finit_module(fd, "", 0);
+    rc = finit_module(fd, module_params, 0);
     if (rc < 0) {
         warn2("failed to insert module", module_path);
         close(fd);
@@ -442,6 +556,10 @@ int main() {
     // Init /dev and start /dev/console for early debugging
     init_dev();
     init_console();
+
+    // Set up procfs to get access to the kernel cmdline
+    // This is needed to parse module specific cmdline paramters
+    init_fs(early_ops, sizeof(early_ops) / sizeof(early_ops[0]));
 
     // Insert kernel modules from modules_load_order
     init_modules();
